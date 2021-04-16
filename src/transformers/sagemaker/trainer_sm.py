@@ -26,6 +26,7 @@ from ..modeling_utils import PreTrainedModel, unwrap_model
 from ..trainer import Trainer
 from ..trainer_pt_utils import (
     DistributedLengthGroupedSampler,
+    DistributedSamplerWithLoop,
     SequentialDistributedSampler,
     nested_detach,
     nested_numpify,
@@ -33,13 +34,13 @@ from ..trainer_pt_utils import (
 )
 from ..trainer_utils import PREFIX_CHECKPOINT_DIR
 from ..utils import logging
-from .training_args_sm import is_smdistributed_available
+from .training_args_sm import is_sagemaker_model_parallel_available
 
 
 logger = logging.get_logger(__name__)
 
 
-if is_smdistributed_available():
+if is_sagemaker_model_parallel_available():
     import smdistributed.modelparallel.torch as smp
 
     @smp.step()
@@ -78,7 +79,12 @@ if is_smdistributed_available():
 
 class SageMakerTrainer(Trainer):
     def __init__(self, args=None, **kwargs):
-        self.is_model_parallel_enabled = is_smdistributed_available() and args.mp_parameters != ""
+        warnings.warn(
+            "`SageMakerTrainer` is deprecated and will be removed in v5 of Transformers. You can use `Trainer` "
+            "instead.",
+            FutureWarning,
+        )
+        self.is_model_parallel_enabled = is_sagemaker_model_parallel_available()
         super().__init__(args=args, **kwargs)
 
     def is_world_process_zero(self) -> bool:
@@ -97,6 +103,13 @@ class SageMakerTrainer(Trainer):
                 return DistributedLengthGroupedSampler(
                     self.train_dataset, self.args.train_batch_size, num_replicas=smp.dp_size(), rank=smp.dp_rank()
                 )
+            elif not self.args.dataloader_drop_last:
+                return DistributedSamplerWithLoop(
+                    self.train_dataset,
+                    self.args.per_device_train_batch_size,
+                    num_replicas=smp.dp_size(),
+                    rank=smp.dp_rank(),
+                )
             else:
                 return DistributedSampler(self.train_dataset, num_replicas=smp.dp_size(), rank=smp.dp_rank())
         else:
@@ -104,7 +117,12 @@ class SageMakerTrainer(Trainer):
 
     def _get_eval_sampler(self, eval_dataset: Dataset) -> Optional[torch.utils.data.sampler.Sampler]:
         if self.is_model_parallel_enabled:
-            return SequentialDistributedSampler(eval_dataset, num_replicas=smp.dp_size(), rank=smp.dp_rank())
+            return SequentialDistributedSampler(
+                eval_dataset,
+                num_replicas=smp.dp_size(),
+                rank=smp.dp_rank(),
+                batch_size=self.args.per_device_eval_batch_size,
+            )
         else:
             return super()._get_eval_sampler(eval_dataset)
 
@@ -163,7 +181,7 @@ class SageMakerTrainer(Trainer):
             return
         output_dir = output_dir if output_dir is not None else self.args.output_dir
         os.makedirs(output_dir, exist_ok=True)
-        logger.info("Saving model checkpoint to %s", output_dir)
+        logger.info(f"Saving model checkpoint to {output_dir}")
         # Calling the state_dict needs to be done on the wrapped model
         state_dict = self.model_wrapped.state_dict()
 
