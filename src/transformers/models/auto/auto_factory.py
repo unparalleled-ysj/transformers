@@ -14,11 +14,16 @@
 # limitations under the License.
 """Factory function to build auto-model classes."""
 
-import functools
 import types
 
 from ...configuration_utils import PretrainedConfig
+from ...file_utils import copy_func
+from ...integrations import deepspeed_config, is_deepspeed_zero3_enabled
+from ...utils import logging
 from .configuration_auto import AutoConfig, replace_list_option_in_docstrings
+
+
+logger = logging.get_logger(__name__)
 
 
 CLASS_DOCSTRING = """
@@ -362,7 +367,16 @@ class _BaseAutoModelClass:
     def from_config(cls, config, **kwargs):
         if type(config) in cls._model_mapping.keys():
             model_class = _get_model_class(config, cls._model_mapping)
-            return model_class(config, **kwargs)
+            if is_deepspeed_zero3_enabled():
+                import deepspeed
+
+                logger.info("Detected DeepSpeed ZeRO-3: activating zero.init() for this model")
+                # this immediately partitions the model across all gpus, to avoid the overhead in time
+                # and memory copying it on CPU or each GPU first
+                with deepspeed.zero.Init(config=deepspeed_config()):
+                    return model_class(config, **kwargs)
+            else:
+                return model_class(config, **kwargs)
         raise ValueError(
             f"Unrecognized configuration class {config.__class__} for this kind of AutoModel: {cls.__name__}.\n"
             f"Model type should be one of {', '.join(c.__name__ for c in cls._model_mapping.keys())}."
@@ -383,15 +397,6 @@ class _BaseAutoModelClass:
             f"Unrecognized configuration class {config.__class__} for this kind of AutoModel: {cls.__name__}.\n"
             f"Model type should be one of {', '.join(c.__name__ for c in cls._model_mapping.keys())}."
         )
-
-
-def copy_func(f):
-    """ Returns a copy of a function f."""
-    # Based on http://stackoverflow.com/a/6528148/190597 (Glenn Maynard)
-    g = types.FunctionType(f.__code__, f.__globals__, name=f.__name__, argdefs=f.__defaults__, closure=f.__closure__)
-    g = functools.update_wrapper(g, f)
-    g.__kwdefaults__ = f.__kwdefaults__
-    return g
 
 
 def insert_head_doc(docstring, head_doc=""):

@@ -569,6 +569,8 @@ DEPARALLELIZE_DOCSTRING = r"""
     GPT2_START_DOCSTRING,
 )
 class GPT2Model(GPT2PreTrainedModel):
+    _keys_to_ignore_on_load_missing = ["attn.masked_bias"]
+
     def __init__(self, config):
         super().__init__(config)
 
@@ -675,6 +677,8 @@ class GPT2Model(GPT2PreTrainedModel):
         else:
             raise ValueError("You have to specify either input_ids or inputs_embeds")
 
+        device = input_ids.device if input_ids is not None else inputs_embeds.device
+
         if token_type_ids is not None:
             token_type_ids = token_type_ids.view(-1, input_shape[-1])
         if position_ids is not None:
@@ -686,7 +690,6 @@ class GPT2Model(GPT2PreTrainedModel):
         else:
             past_length = past_key_values[0][0].size(-2)
         if position_ids is None:
-            device = input_ids.device if input_ids is not None else inputs_embeds.device
             position_ids = torch.arange(past_length, input_shape[-1] + past_length, dtype=torch.long, device=device)
             position_ids = position_ids.unsqueeze(0).view(-1, input_shape[-1])
 
@@ -1006,6 +1009,8 @@ input sequence).
     GPT2_START_DOCSTRING,
 )
 class GPT2DoubleHeadsModel(GPT2PreTrainedModel):
+    _keys_to_ignore_on_load_missing = [r"attn.masked_bias", r"attn.bias", r"lm_head.weight"]
+
     def __init__(self, config):
         super().__init__(config)
         config.num_labels = 1
@@ -1235,7 +1240,7 @@ class GPT2ForSequenceClassification(GPT2PreTrainedModel):
     @add_start_docstrings_to_model_forward(GPT2_INPUTS_DOCSTRING)
     @add_code_sample_docstrings(
         tokenizer_class=_TOKENIZER_FOR_DOC,
-        checkpoint="microsoft/dialogrpt",
+        checkpoint="microsoft/DialogRPT-updown",
         output_type=SequenceClassifierOutputWithPast,
         config_class=_CONFIG_FOR_DOC,
     )

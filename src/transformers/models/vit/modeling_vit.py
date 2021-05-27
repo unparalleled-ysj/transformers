@@ -372,7 +372,7 @@ class ViTPreTrainedModel(PreTrainedModel):
     base_model_prefix = "vit"
 
     def _init_weights(self, module):
-        """ Initialize the weights """
+        """Initialize the weights"""
         if isinstance(module, (nn.Linear, nn.Conv2d)):
             # Slightly different from the TF version which uses truncated_normal for initialization
             # cf https://github.com/pytorch/pytorch/pull/5617
@@ -403,9 +403,8 @@ VIT_START_DOCSTRING = r"""
 VIT_INPUTS_DOCSTRING = r"""
     Args:
         pixel_values (:obj:`torch.FloatTensor` of shape :obj:`(batch_size, num_channels, height, width)`):
-            Pixel values. Padding will be ignored by default should you provide it. Pixel values can be obtained using
-            :class:`~transformers.ViTFeatureExtractor`. See :meth:`transformers.ViTFeatureExtractor.__call__` for
-            details.
+            Pixel values. Pixel values can be obtained using :class:`~transformers.ViTFeatureExtractor`. See
+            :meth:`transformers.ViTFeatureExtractor.__call__` for details.
 
         head_mask (:obj:`torch.FloatTensor` of shape :obj:`(num_heads,)` or :obj:`(num_layers, num_heads)`, `optional`):
             Mask to nullify selected heads of the self-attention modules. Mask values selected in ``[0, 1]``:
