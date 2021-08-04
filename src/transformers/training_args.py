@@ -14,6 +14,7 @@
 
 import contextlib
 import json
+import math
 import os
 import warnings
 from dataclasses import asdict, dataclass, field
@@ -172,8 +173,7 @@ class TrainingArguments:
         logging_steps (:obj:`int`, `optional`, defaults to 500):
             Number of update steps between two logs if :obj:`logging_strategy="steps"`.
         save_strategy (:obj:`str` or :class:`~transformers.trainer_utils.IntervalStrategy`, `optional`, defaults to :obj:`"steps"`):
-            The checkpoint save strategy to adopt during training (Note that when :obj:`load_best_model_at_end=True`,
-            this parameter is ignored and the model is saved after each evaluation). Possible values are:
+            The checkpoint save strategy to adopt during training. Possible values are:
 
                 * :obj:`"no"`: No save is done during training.
                 * :obj:`"epoch"`: Save is done at the end of each epoch.
@@ -183,6 +183,12 @@ class TrainingArguments:
         save_total_limit (:obj:`int`, `optional`):
             If a value is passed, will limit the total amount of checkpoints. Deletes the older checkpoints in
             :obj:`output_dir`.
+        save_on_each_node (:obj:`bool`, `optional`, defaults to :obj:`False`):
+            When doing multi-node distributed training, whether to save models and checkpoints on each node, or only on
+            the main one.
+
+            This should not be activated when the different nodes use the same storage as the files will be saved with
+            the same names for each node.
         no_cuda (:obj:`bool`, `optional`, defaults to :obj:`False`):
             Whether to not use CUDA even when it is available or not.
         seed (:obj:`int`, `optional`, defaults to 42):
@@ -241,8 +247,9 @@ class TrainingArguments:
 
             .. note::
 
-                When set to :obj:`True`, the parameters :obj:`save_strategy` and :obj:`save_steps` will be ignored and
-                the model will be saved after each evaluation.
+                When set to :obj:`True`, the parameters :obj:`save_strategy` needs to be the same as
+                :obj:`eval_strategy`, and in the case it is "steps", :obj:`save_steps` must be a round multiple of
+                :obj:`eval_steps`.
         metric_for_best_model (:obj:`str`, `optional`):
             Use in conjunction with :obj:`load_best_model_at_end` to specify the metric to use to compare two different
             models. Must be the name of a metric returned by the evaluation with or without the prefix :obj:`"eval_"`.
@@ -456,6 +463,12 @@ class TrainingArguments:
             )
         },
     )
+    save_on_each_node: bool = field(
+        default=False,
+        metadata={
+            "help": "When doing multi-node distributed training, whether to save models and checkpoints on each node, or only on the main one"
+        },
+    )
     no_cuda: bool = field(default=False, metadata={"help": "Do not use CUDA even when it is available"})
     seed: int = field(default=42, metadata={"help": "Random seed that will be set at the beginning of training."})
 
@@ -651,8 +664,33 @@ class TrainingArguments:
         self.lr_scheduler_type = SchedulerType(self.lr_scheduler_type)
         if self.do_eval is False and self.evaluation_strategy != IntervalStrategy.NO:
             self.do_eval = True
-        if self.eval_steps is None:
-            self.eval_steps = self.logging_steps
+
+        # eval_steps has to be defined and non-zero, fallbacks to logging_steps if the latter is non-zero
+        if self.evaluation_strategy == IntervalStrategy.STEPS and (self.eval_steps is None or self.eval_steps == 0):
+            if self.logging_steps > 0:
+                logger.info(f"using `logging_steps` to initialize `eval_steps` to {self.logging_steps}")
+                self.eval_steps = self.logging_steps
+            else:
+                raise ValueError(
+                    f"evaluation strategy {self.evaluation_strategy} requires either non-zero --eval_steps or --logging_steps"
+                )
+
+        # logging_steps must be non-zero for logging_strategy that is other than 'no'
+        if self.logging_strategy == IntervalStrategy.STEPS and self.logging_steps == 0:
+            raise ValueError(f"logging strategy {self.logging_strategy} requires non-zero --logging_steps")
+
+        # Sanity checks for load_best_model_at_end: we require save and eval strategies to be compatible.
+        if self.load_best_model_at_end:
+            if self.evaluation_strategy != self.save_strategy:
+                raise ValueError(
+                    "--load_best_model_at_end requires the save and eval strategy to match, but found\n- Evaluation "
+                    f"strategy: {self.evaluation_strategy}\n- Save strategy: {self.save_strategy}"
+                )
+            if self.evaluation_strategy == IntervalStrategy.STEPS and self.save_steps % self.eval_steps != 0:
+                raise ValueError(
+                    "--load_best_model_at_end requires the saving steps to be a round multiple of the evaluation "
+                    f"steps, but found {self.save_steps}, which is not a round multiple of {self.eval_steps}."
+                )
 
         if self.load_best_model_at_end and self.metric_for_best_model is None:
             self.metric_for_best_model = "loss"
@@ -787,10 +825,7 @@ class TrainingArguments:
             device = torch.device("cuda", self.local_rank)
             self._n_gpu = 1
         elif self.deepspeed:
-            # deepspeed performs its own DDP internally, and requires the program to be started with:
-            # deepspeed  ./program.py
-            # rather than:
-            # python -m torch.distributed.launch --nproc_per_node=2 ./program.py
+            # deepspeed inits torch.distributed internally
             from .deepspeed import is_deepspeed_available
 
             if not is_deepspeed_available():
@@ -937,6 +972,19 @@ class TrainingArguments:
             else:
                 return self.process_index == 0
 
+    @property
+    def should_save(self):
+        """
+        Whether or not the current process should write to disk, e.g., to save models and checkpoints.
+        """
+        if self.save_on_each_node:
+            return self.local_process_index == 0
+        else:
+            if is_sagemaker_mp_enabled():
+                return smp.rank() == 0
+            else:
+                return self.process_index == 0
+
     def get_process_log_level(self):
         """
         Returns the log level to be used depending on whether this process is the main process of node 0, main process
@@ -1002,15 +1050,34 @@ class TrainingArguments:
                 if not is_main_process:
                     # tell all replicas to wait
                     logger.debug(f"{self.process_index}: waiting for the {main_process_desc} to perform {desc}")
-                    torch.distributed.barrier()
+                    if is_torch_tpu_available():
+                        xm.rendezvous(desc)
+                    elif is_sagemaker_dp_enabled():
+                        sm_dist.Barrier()
+                    else:
+                        torch.distributed.barrier()
                 yield
             finally:
                 if is_main_process:
                     # the wait is over
                     logger.debug(f"{self.process_index}: {main_process_desc} completed {desc}, releasing all replicas")
-                    torch.distributed.barrier()
+                    if is_torch_tpu_available():
+                        xm.rendezvous(desc)
+                    elif is_sagemaker_dp_enabled():
+                        sm_dist.Barrier()
+                    else:
+                        torch.distributed.barrier()
         else:
             yield
+
+    def get_warmup_steps(self, num_training_steps: int):
+        """
+        Get number of steps used for a linear warmup.
+        """
+        warmup_steps = (
+            self.warmup_steps if self.warmup_steps > 0 else math.ceil(num_training_steps * self.warmup_ratio)
+        )
+        return warmup_steps
 
     def to_dict(self):
         """
